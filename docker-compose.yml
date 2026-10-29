@@ -1,0 +1,131 @@
+# Módulo de Fiscalización — Centro de Control (Caso 4)
+# Levantar todo:            docker compose up --build
+# Con réplica de lectura:   docker compose --profile replica up --build
+name: fiscalizacion
+
+x-app: &app
+  build: ./backend
+  env_file: .env
+  restart: unless-stopped
+
+services:
+  # ── Persistencia: PostgreSQL + extensión TimescaleDB (nodo primario) ─────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+    command: >
+      postgres -c wal_level=replica -c max_wal_senders=5
+      -c max_replication_slots=5 -c hot_standby=on
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Se montan archivos sueltos (no la carpeta) para no pisar los scripts
+      # 000_install_timescaledb.sh / 001_timescaledb_tune.sh de la imagen.
+      - ./db/init/10_replicacion.sh:/docker-entrypoint-initdb.d/10_replicacion.sh:ro
+      - ./db/init/20_schema.sql:/docker-entrypoint-initdb.d/20_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── Réplica de solo lectura para auditoría y reportes (opcional) ─────────────
+  timescaledb-replica:
+    profiles: ["replica"]
+    image: timescale/timescaledb:latest-pg16
+    depends_on:
+      timescaledb: { condition: service_healthy }
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+    entrypoint: ["/bin/bash", "/replica-entrypoint.sh"]
+    ports: ["5433:5432"]
+    volumes:
+      - pgreplica:/var/lib/postgresql/data
+      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.8.0
+    ports: ["9094:9094"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports: ["1883:1883"]
+    volumes:
+      - ./infra/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  # ── Monolito modular (back-office): auth, fiscalización, reportes, WebSocket ─
+  backend:
+    <<: *app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    depends_on:
+      timescaledb: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  # ── Hot path (despliegues independientes): ingesta y procesamiento ───────────
+  gateway:
+    <<: *app
+    command: python -m app.pipeline.gateway
+    depends_on:
+      mosquitto: { condition: service_started }
+      kafka: { condition: service_healthy }
+
+  processor:
+    <<: *app
+    command: python -m app.pipeline.processor
+    depends_on:
+      timescaledb: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      backend: { condition: service_started }   # el backend crea el catálogo (seed)
+
+  # ── Simulador de OBUs (reemplaza a los buses reales) ─────────────────────────
+  simulator:
+    <<: *app
+    command: python -m app.simulator
+    depends_on:
+      backend: { condition: service_started }
+      mosquitto: { condition: service_started }
+
+  frontend:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on: [backend]
+
+volumes:
+  pgdata:
+  pgreplica:
